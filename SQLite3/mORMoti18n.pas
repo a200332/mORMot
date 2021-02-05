@@ -6,7 +6,7 @@ unit mORMoti18n;
 (*
     This file is part of Synopse mORMot framework.
 
-    Synopse mORMot framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse mORMot framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit mORMoti18n;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -1086,6 +1086,7 @@ end;
 
 {$ifndef ENHANCEDRTL}
 function i18nInnerCompareStr(const S1, S2: AnsiString): Integer;
+  {$ifdef FPC} nostackframe; assembler; {$endif}
 // original name: CompareStr_PLR_IA32_14
 asm
   cmp eax, edx
@@ -1183,6 +1184,7 @@ end;
 {$endif}
 
 function i18nInnerCompareText(const S1, S2: AnsiString): Integer;
+  {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // fast CompareText() version using i18nToUpper[] instead of NormToUpper[]
     cmp eax,edx
     je @2

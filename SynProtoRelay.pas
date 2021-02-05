@@ -6,7 +6,7 @@ unit SynProtoRelay;
 {
     This file is part of Synopse mORMot framework.
 
-    Synopse mORMot framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse mORMot framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit SynProtoRelay;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -796,12 +796,14 @@ begin
      [aClientsPort, aServerPort, BOOL_STR[aServerKey<>''], aServerJWT], self);
   fServerJWT := aServerJWT;
   fServer := TWebSocketServer.Create(aServerPort, nil, nil, 'relayserver');
+  fServer.WaitStarted;
   if fServerJWT <> nil then
     fServer.OnBeforeBody := OnServerBeforeBody;
   fServer.OnRequest := OnServerRequest;
   fServer.WebSocketProtocols.Add(TRelayServerProtocol.Create(self, aServerKey));
   fClients := TWebSocketServer.Create(aClientsPort, nil, nil, 'relayclients',
     aClientsThreadPoolCount, aClientsKeepAliveTimeOut);
+  fClients.WaitStarted;
   fClients.WebSocketProtocols.Add(TSynopseServerProtocol.Create(self));
   fClients.OnRequest := OnClientsRequest;
   if log<>nil then

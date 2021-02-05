@@ -6,7 +6,7 @@ unit SynZip;
 {
     This file is part of Synopse framework.
 
-    Synopse framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,11 +25,12 @@ unit SynZip;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
    - Alf
+   - Andre Heider (dhewg)
    - ehansen
    - jpdk
    - Gigo
@@ -513,7 +514,6 @@ function deflateInit2_(var strm: TZStream;
   version: PAnsiChar; stream_size: integer): integer; cdecl;
 function inflateInit2_(var strm: TZStream; windowBits: integer;
   version: PAnsiChar; stream_size: integer): integer; cdecl;
-function get_crc_table: pointer; cdecl;
 {$endif USEINLINEASM}
 {$endif USEPASZLIB}
 
@@ -693,6 +693,8 @@ type
   end;
 
   /// abstract write-only access for creating a .zip archive
+  // - update can be done manualy by using a TZipRead instance and the
+  // AddFromZip() method
   TZipWriteAbstract = class
   protected
     fAppendOffset: cardinal;
@@ -724,6 +726,8 @@ type
     // - by default, the 1st of January, 2010 is used if not date is supplied
     procedure AddStored(const aZipName: TFileName; Buf: pointer; Size: integer;
       FileAge: integer=1+1 shl 5+30 shl 9);
+    /// add a file from an already compressed zip entry
+    procedure AddFromZip(const ZipEntry: TZipEntry);
     /// append a file content into the destination file
     // - useful to add the initial Setup.exe file, e.g.
     procedure Append(const Content: ZipString);
@@ -733,8 +737,6 @@ type
 
   /// write-only access for creating a .zip archive file
   // - not to be used to update a .zip file, but to create a new one
-  // - update can be done manualy by using a TZipRead instance and the
-  // AddFromZip() method
   TZipWrite = class(TZipWriteAbstract)
   protected
     fFileName: TFileName;
@@ -760,8 +762,6 @@ type
     // - if Recursive is TRUE, would include files from nested sub-folders
     procedure AddFolder(const FolderName: TFileName; const Mask: TFileName=ZIP_FILES_ALL;
       Recursive: boolean=true; CompressLevel: integer=6);
-    /// add a file from an already compressed zip entry
-    procedure AddFromZip(const ZipEntry: TZipEntry);
     /// release associated memory, and close destination file
     destructor Destroy; override;
   end;
@@ -914,7 +914,7 @@ begin
       tmpsize := (Int64(Size)*11) div 10+12;
       Getmem(tmp,tmpSize);
       zzipSize := CompressMem(Buf,tmp,Size,tmpSize,CompressLevel);
-      InternalAdd(aZipName,tmp,zzipSize); // write stored data
+      InternalAdd(aZipName,tmp,zzipSize); // write deflated data and inc(Count)
       Freemem(tmp);
     end;
   end;
@@ -932,7 +932,19 @@ begin
     zfullSize := Size;
     zzipSize := Size;
     zlastMod := FileAge;
-    InternalAdd(aZipName,Buf,Size);
+    InternalAdd(aZipName,Buf,Size); // write stored data and inc(Count)
+  end;
+end;
+
+procedure TZipWriteAbstract.AddFromZip(const ZipEntry: TZipEntry);
+begin
+  if self=nil then
+    exit;
+  if Count>=length(Entry) then
+    SetLength(Entry,length(Entry)+20);
+  with Entry[Count] do begin
+    fhr.fileInfo := ZipEntry.infoLocal^;
+    InternalAdd(ZipEntry.zipName,ZipEntry.data,fhr.fileInfo.zzipSize);
   end;
 end;
 
@@ -1041,7 +1053,7 @@ begin
       raise ESynZipException.CreateFmt('%s file too big for .zip',[aFileName]);
     if Count>=length(Entry) then
       SetLength(Entry,length(Entry)+20);
-    OffsHead := InternalAdd(ZipName,nil,0);
+    OffsHead := InternalAdd(ZipName,nil,0); // write data and inc(Count)
     D := THandleStream.Create(Handle);
     Z := TSynZipCompressor.Create(D,CompressLevel);
     try
@@ -1072,18 +1084,6 @@ begin
     end;
   finally
     S.Free;
-  end;
-end;
-
-procedure TZipWrite.AddFromZip(const ZipEntry: TZipEntry);
-begin
-  if (self=nil) or (Handle<=0) then
-    exit;
-  if Count>=length(Entry) then
-    SetLength(Entry,length(Entry)+20);
-  with Entry[Count] do begin
-    fhr.fileInfo := ZipEntry.infoLocal^;
-    InternalAdd(ZipEntry.zipName,ZipEntry.data,fhr.fileInfo.zzipSize);
   end;
 end;
 
@@ -1558,6 +1558,7 @@ end;
 const
   GZHEAD: array [0..2] of cardinal = ($088B1F,0,0);
   GZHEAD_SIZE = 10;
+
 type
   TGZFlags = set of (gzfText, gzfHCRC, gzfExtra, gzfName, gzfComment);
 
@@ -4613,7 +4614,6 @@ asm  pop ebp  // auto-generated push ebp; mov ebp,esp
         xor     eax, eax
         pop     esi
         ret     4
-
 @@195:  mov     eax, -2
         pop     esi
         ret     4
@@ -4635,25 +4635,20 @@ asm
 	jne       @31
 	mov       eax,1
 	jmp       @32
-@31:
-	test      ebp,ebp
+@31:    test      ebp,ebp
 	jbe       @34
-@33:
-	cmp       ebp,5552
+@33:    cmp       ebp,5552
 	jae        @35
 	mov       eax,ebp
 	jmp        @36
-  nop; nop
-@35:
-	mov       eax,5552
-@36:
-	sub       ebp,eax
+        nop; nop
+@35:    mov       eax,5552
+@36:    sub       ebp,eax
 	cmp       eax,16
 	jl        @38
 	xor       edx,edx
 	xor       ecx,ecx
-@39:
-	sub       eax,16
+@39:    sub       eax,16
 	mov       dl,[esi]
 	mov       cl,[esi+1]
 	add       ebx,edx
@@ -4705,19 +4700,16 @@ asm
 	lea       esi,[esi+16]
 	lea       edi,[edi+ebx]
 	jge       @39
-@38:
-	test      eax,eax
-	je         @42
-@43:
-	xor       edx,edx
+@38:    test      eax,eax
+	je        @42
+@43:    xor       edx,edx
 	mov       dl,[esi]
 	add       ebx,edx
 	dec       eax
 	lea       esi,[esi+1]
-  lea       edi,[edi+ebx]
+        lea       edi,[edi+ebx]
 	jg        @43
-@42:
-	mov       ecx,65521
+@42:    mov       ecx,65521
 	mov       eax,ebx
 	xor       edx,edx
 	div       ecx
@@ -4729,13 +4721,11 @@ asm
 	test      ebp,ebp
 	mov       edi,edx
 	ja        @33
-@34:
-	mov       eax,edi
+@34:    mov       eax,edi
 	shl       eax,16
 	or        eax,ebx
 @45:
-@32:
-	pop       ebp
+@32:    pop       ebp
 	pop       edi
 	pop       esi
 	pop       ebx
@@ -4995,7 +4985,6 @@ function deflateInit2_(var strm: TZStream;
   version: PAnsiChar; stream_size: integer): integer; cdecl; external;
 function inflateInit2_(var strm: TZStream; windowBits: integer;
   version: PAnsiChar; stream_size: integer): integer; cdecl; external;
-function get_crc_table: pointer; cdecl; external;
 
 {$endif FPC}
 

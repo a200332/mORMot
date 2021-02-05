@@ -6,7 +6,7 @@ unit SynSQLite3;
 {
     This file is part of Synopse mORMot framework.
 
-    Synopse mORMot framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse mORMot framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit SynSQLite3;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -48,10 +48,10 @@ unit SynSQLite3;
   ***** END LICENSE BLOCK *****
 
 
-     SQLite3 3.31.0 database engine
+     SQLite3 3.34.1 database engine
     ********************************
 
-   Brand new SQLite3 library to be used with Delphi
+   Brand new SQLite3 library to be used with Delphi/FPC
   - FLEXIBLE: in process, local or remote access (JSON RESTFUL HTTP server)
   - STANDARD: full UTF-8 and Unicode, SQLite3 engine (enhanced but not hacked)
   - SECURE: tested, multi-thread oriented, atomic commit, encryption ready
@@ -1187,7 +1187,7 @@ type
     close: function(DB: TSQLite3DB): integer; cdecl;
 
     /// Return the version of the SQLite database engine, in ascii format
-    // - currently returns '3.31.0', when used with our SynSQLite3Static unit
+    // - currently returns '3.34.1', when used with our SynSQLite3Static unit
     // - if an external SQLite3 library is used, version may vary
     // - you may use the VersionText property (or Version for full details) instead
     libversion: function: PUTF8Char; cdecl;
@@ -2682,6 +2682,7 @@ type
     fBackupBackgroundInProcess: TSQLDatabaseBackupThread;
     fBackupBackgroundLastTime: RawUTF8;
     fBackupBackgroundLastFileName: TFileName;
+    fUseCacheSize: integer;
     {$ifdef WITHLOG}
     fLogResultMaximumSize: integer;
     fLog: TSynLogClass;
@@ -2786,7 +2787,8 @@ type
     // - initialize a internal mutex to ensure that all access to the database is atomic
     // - raise an ESQLite3Exception on any error
     constructor Create(const aFileName: TFileName; const aPassword: RawUTF8='';
-      aOpenV2Flags: integer=0; aDefaultCacheSize: integer=10000; aDefaultPageSize: integer=4096); reintroduce;
+      aOpenV2Flags: integer=0; aDefaultCacheSize: integer=10000;
+      aDefaultPageSize: integer=4096); reintroduce;
     /// close a database and free its memory and context
     //- if TransactionBegin was called but not commited, a RollBack is performed
     destructor Destroy; override;
@@ -3035,6 +3037,9 @@ type
     // - cache is consistent only if ExecuteJSON() Expand parameter is constant
     // - cache is used by TSQLDataBase.ExecuteJSON() and TSQLTableDB.Create()
     property UseCache: boolean read GetUseCache write SetUseCache;
+    /// cache size in JSON bytes, to be set before UseCache is set to true
+    // - default is 16MB
+    property UseCacheSize: integer read fUseCacheSize write fUseCacheSize;
     /// return TRUE if a Transaction begun
     property TransactionActive: boolean read fTransactionActive;
     /// sets a busy handler that sleeps for a specified amount of time
@@ -3905,6 +3910,7 @@ begin
     fIsMemory := true else
     fFileNameWithoutPath := ExtractFileName(fFileName);
   fPassword := aPassword;
+  fUseCacheSize := 16384*1024;
   fSQLFunctions := TSynObjectList.Create;
   result := DBOpen;
   if result<>SQLITE_OK then
@@ -4228,7 +4234,7 @@ begin
   if self<>nil then
     if Value<>UseCache then
       if Value then
-        fCache := TSynCache.Create(16384*1024,true) else
+        fCache := TSynCache.Create(fUseCacheSize,true) else
         FreeAndNil(fCache);
 end;
 
@@ -4523,7 +4529,7 @@ begin
   utf8 := StringToUTF8(fFileName);
   {$ifdef LINUX}
   // for WAL to work under Linux - see http://www.sqlite.org/vfs.html
-  if assigned(sqlite3.open_v2) then begin
+  if assigned(sqlite3.open_v2) and (fPassword='') then begin
     result := sqlite3.open_v2(pointer(utf8),fDB,fOpenV2Flags,'unix-excl');
     if result<>SQLITE_OK then // may be 'unix-excl' is not supported by the library
       result := sqlite3.open_v2(pointer(utf8),fDB,fOpenV2Flags,nil);
@@ -5258,8 +5264,11 @@ begin
   begin
     result := sqlite3.prepare_v2(RequestDB, pointer(SQL), length(SQL)+1,
       fRequest, fNextSQL);
-    while (result=SQLITE_OK) and (Request=0) do // comment or white-space
+    while (result=SQLITE_OK) and (Request=0) do begin // comment or white-space
+      if fNextSQL^ = #0 then // statement contains only comment
+        raise ESQLite3Exception.Create(DB,SQLITE_EMPTY,SQL);
       result := sqlite3.prepare_v2(RequestDB, fNextSQL, -1, fRequest, fNextSQL);
+    end;
     fFieldCount := sqlite3.column_count(fRequest);
     if not NoExcept then
       sqlite3_check(RequestDB,result,SQL);
@@ -5407,10 +5416,8 @@ end;
 
 function ErrorCodeToText(err: TSQLite3ErrorCode): RawUTF8;
 begin
-  if err=secUnknown then
-    result := 'unknown SQLITE_*' else
-    result := 'SQLITE_'+Copy(ShortStringToUTF8(GetEnumName(
-      TypeInfo(TSQLite3ErrorCode),ord(err))^),4,100);
+  result := 'SQLITE_'+TrimLeftLowerCaseShort(GetEnumName(
+    TypeInfo(TSQLite3ErrorCode),ord(err)));
 end;
 
 function sqlite3_resultToErrorText(aResult: integer): RawUTF8;
@@ -5837,13 +5844,23 @@ begin // varargs attribute was unsupported on Delphi 5
 // due to FPC's linker limitation, all wrapper functions should be defined outside
 var mem: TSQLite3MemMethods;
     res: integer;
+    {$ifdef FPC_X64}
+    mm: TMemoryManager;
+    {$endif FPC_X64}
 begin
   if not Assigned(config) then
     exit;
+  {$ifdef FPC_X64} // SQLite3 prototypes match FPC RTL functions on x86_64 ABI
+  GetMemoryManager(mm);
+  mem.xMalloc := @mm.Getmem;
+  mem.xFree := @mm.Freemem;
+  mem.xSize := @mm.MemSize;
+  {$else}
   mem.xMalloc := @xMalloc;
   mem.xFree := @xFree;
-  mem.xRealloc := @xRealloc;
   mem.xSize := @xSize;
+  {$endif FPC_X64}
+  mem.xRealloc := @xRealloc;
   mem.xRoundup := @xRoundup;
   mem.xInit := @xInit;
   mem.xShutdown := @xShutdown;

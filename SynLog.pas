@@ -6,7 +6,7 @@ unit SynLog;
 (*
     This file is part of Synopse framework.
 
-    Synopse framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit SynLog;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -121,7 +121,7 @@ type
     fUnit: TSynMapUnitDynArray;
     fSymbols: TDynArray;
     fUnits: TDynArrayHashed;
-    fUnitSynLogIndex,fUnitSystemIndex: integer;
+    fSymCount, fUnitCount, fUnitSynLogIndex,fUnitSystemIndex: integer;
     fCodeOffset: PtrUInt;
     fHasDebugInfo: boolean;
   public
@@ -179,10 +179,16 @@ type
     function FindLocation(aAddressAbsolute: PtrUInt): RawUTF8; overload;
     /// return the symbol location according to the supplied ESynException
     // - i.e. unit name, symbol name and line number (if any), as plain text
+    // - under FPC, currently calls BacktraceStrFunc() which may be very slow
     class function FindLocation(exc: ESynException): RawUTF8; overload;
+    /// return the low-level stack trace exception information into human-friendly text
+    class function FindStackTrace(const Ctxt: TSynLogExceptionContext): TRawUTF8DynArray;
     /// returns the file name of
     // - if unitname = '', returns the main file name of the current executable
     class function FindFileName(const unitname: RawUTF8): TFileName;
+    /// returns the global TSynMapFile instance associated with the current
+    // executable
+    class function FromCurrentExecutable: TSynMapFile;
     /// all symbols associated to the executable
     property Symbols: TSynMapSymbolDynArray read fSymbol;
     /// all units, including line numbers, associated to the executable
@@ -419,12 +425,12 @@ type
   // ! end;
   //- then use the logging system inside a method:
   // ! procedure TMyDB.MyMethod;
-  // ! var ILog: ISynLog;
+  // ! var log: ISynLog;
   // ! begin
-  // !   ILog := TSynLogDB.Enter(self,'MyMethod');
+  // !   log := TSynLogDB.Enter(self,'MyMethod');
   // !   // do some stuff
-  // !   ILog.Log(sllInfo,'method called');
-  // ! end;
+  // !   log.Log(sllInfo,'method run with no problem and value=%',[value]);
+  // ! end; // here log will be released and method leaving will be logged
   TSynLogFamily = class
   protected
     fLevel, fLevelStackTrace: TSynLogInfos;
@@ -459,6 +465,7 @@ type
     fExceptionIgnore: TList;
     fOnBeforeException: TSynLogOnBeforeException;
     fEchoToConsole: TSynLogInfos;
+    fEchoToConsoleUseJournal: boolean;
     fEchoCustom: TOnTextWriterEcho;
     fEchoRemoteClient: TObject;
     fEchoRemoteClientOwned: boolean;
@@ -469,14 +476,19 @@ type
     fRotateFileCount: cardinal;
     fRotateFileSize: cardinal;
     fRotateFileAtHour: integer;
+    fRotateFileNoCompression: boolean;
     function CreateSynLog: TSynLog;
-    procedure SetAutoFlush(TimeOut: cardinal);
+    procedure StartAutoFlush;
     procedure SetDestinationPath(const value: TFileName);
     procedure SetLevel(aLevel: TSynLogInfos);
     procedure SynLogFileListEcho(const aEvent: TOnTextWriterEcho; aEventAdd: boolean);
     procedure SetEchoToConsole(aEnabled: TSynLogInfos);
+    procedure SetEchoToConsoleUseJournal(aValue: boolean);
     procedure SetEchoCustom(const aEvent: TOnTextWriterEcho);
     function GetSynLogClassName: string;
+    function GetExceptionIgnoreCurrentThread: boolean;
+    procedure SetExceptionIgnoreCurrentThread(
+      aExceptionIgnoreCurrentThread: boolean);
   public
     /// intialize for a TSynLog class family
     // - add it in the global SynLogFileFamily[] list
@@ -516,7 +528,18 @@ type
     // - for instance, EConvertError may be added to the list, as such:
     // ! TSQLLog.Family.ExceptionIgnore.Add(EConvertError);
     // - you may also trigger ESynLogSilent exceptions for silent process
+    // - see also ExceptionIgnoreCurrentThread property, if you want a per-thread
+    // filtering of all exceptions
     property ExceptionIgnore: TList read fExceptionIgnore;
+    /// allow to (temporarly) ignore exceptions in the current thread
+    // - this property will affect all TSynLogFamily instances, for the
+    // current thread
+    // - may be used in a try...finally block e.g. when notifying the exception
+    // to a third-party service, or during a particular process
+    // - see also ExceptionIgnore property - which is also checked in addition
+    // to this flag
+    property ExceptionIgnoreCurrentThread: boolean
+      read GetExceptionIgnoreCurrentThread write SetExceptionIgnoreCurrentThread;
     /// you can let exceptions be ignored from a callback
     // - if set and returns true, the given exception won't be logged
     // - execution of this event handler is protected via the logs global lock
@@ -551,6 +574,14 @@ type
     // - can be set e.g. to LOG_VERBOSE in order to echo every kind of events
     // - EchoCustom or EchoToConsole can be activated separately
     property EchoToConsole: TSynLogInfos read fEchoToConsole write SetEchoToConsole;
+    /// For Linux with journald
+    // - if true: redirect all EchoToConsole logging into journald service
+    // - such logs can be exported into a format whichcan be viewed by our
+    // LogView tool using a command (replacing UNIT with your unit name and
+    // PROCESS with the executable name):
+    // $ "journalctl -u UNIT --no-hostname -o short-iso-precise --since today | grep "PROCESS\[.*\]:  . " > todaysLog.log"
+    property EchoToConsoleUseJournal: boolean read fEchoToConsoleUseJournal
+      write SetEchoToConsoleUseJournal;
     /// can be set to a callback which will be called for each log line
     // - could be used with a third-party logging system
     // - EchoToConsole or EchoCustom can be activated separately
@@ -637,7 +668,7 @@ type
     // - in order not to loose any log, a background thread can be created
     // and will be responsible of flushing all pending log content every
     // period of time (e.g. every 10 seconds)
-    property AutoFlushTimeOut: cardinal read fAutoFlush write SetAutoFlush;
+    property AutoFlushTimeOut: cardinal read fAutoFlush write fAutoFlush;
     {$ifdef MSWINDOWS}
     /// force no environment variables to be written to the log file
     // - may be usefull if they contain some sensitive information
@@ -670,6 +701,8 @@ type
     // specified hour
     // - is not used if RotateFileCount is left to its default 0
     property RotateFileDailyAtHour: integer read fRotateFileAtHour write fRotateFileAtHour;
+    /// if set to TRUE, no #.synlz will be created at rotation but plain #.log file
+    property RotateFileNoCompression: boolean read fRotateFileNoCompression write fRotateFileNoCompression;
     /// the recursive depth of stack trace symbol to write
     // - used only if exceptions are handled, or by sllStackTrace level
     // - default value is 30, maximum is 255
@@ -865,19 +898,23 @@ type
     /// handle generic method enter / auto-leave tracing
     // - this is the main method to be called within a procedure/function to trace:
     // ! procedure TMyDB.SQLExecute(const SQL: RawUTF8);
-    // ! var ILog: ISynLog;
+    // ! var log: ISynLog;
     // ! begin
-    // !   ILog := TSynLogDB.Enter(self,'SQLExecute');
+    // !   log := TSynLogDB.Enter(self,'SQLExecute');
     // !   // do some stuff
-    // !   ILog.Log(sllInfo,'SQL=%',[SQL]);
-    // ! end;
+    // !   log.Log(sllInfo,'SQL=%',[SQL]);
+    // ! end; // here log will be released, and method leaving will be logged
     // - returning a ISynLog interface will allow you to have an automated
     // sllLeave log created when the method is left (thanks to the hidden
     // try..finally block generated by the compiler to protect the ISynLog var)
-    // - it is convenient to define a local variable to store the returned ISynLog
-    // and use it for any specific logging within the method execution
-    // - if you just need to access the log inside the method block, you may
-    // not need any ISynLog interface variable:
+    // - WARNING: due to a limitation (feature?) of the FPC compiler and
+    // Delphi 10.4 and later, you NEED to hold the returned value into a
+    // local ISynLog variable; as a benefit, it is always convenient to define
+    // a local variable to store the returned ISynLog and use it for any
+    // specific logging within the method execution
+    // - on Delphi earlier to 10.4 (and not FPC), you could just call Enter()
+    // inside the method block, without any ISynLog interface variable - but
+    // it is not very future-proof to write the following code:
     // ! procedure TMyDB.SQLFlush;
     // ! begin
     // !   TSynLogDB.Enter(self,'SQLFlush');
@@ -885,10 +922,12 @@ type
     // ! end;
     // - if no Method name is supplied, it will use the caller address, and
     // will write it as hexa and with full unit and symbol name, if the debugging
-    // information is available (i.e. if TSynMapFile retrieved the .map content):
+    // information is available (i.e. if TSynMapFile retrieved the .map content;
+    // note that this is not available yet on FPC):
     // ! procedure TMyDB.SQLFlush;
+    // ! var log: ISynLog;
     // ! begin
-    // !   TSynLogDB.Enter(self);
+    // !   log := TSynLogDB.Enter(self);
     // !   // do some stuff
     // ! end;
     // - note that supplying a method name is faster than using the .map content:
@@ -905,16 +944,6 @@ type
     //  $ 20110325 19325801  +    MyDBUnit.TMyDB(004E11F4).SQLExecute
     //  $ 20110325 19325801 info   SQL=SELECT * FROM Table;
     //  $ 20110325 19325801  -    01.512.320
-    // - note that due to a limitation (feature?) of the FPC compiler, you need
-    // to hold the returned value into a local ISynLog variable, as such:
-    // ! procedure TMyDB.SQLFlush;
-    // ! var Log: ISynLog;
-    // ! begin
-    // !   Log := TSynLogDB.Enter(self);
-    // !   // do some stuff
-    // ! end; // here Log will be released
-    // otherwise, the ISynLog instance would be released just after the Enter()
-    // call, so the timing won't match the method execution
     class function Enter(aInstance: TObject=nil; aMethodName: PUTF8Char=nil;
       aMethodNameLocal: boolean=false): ISynLog; overload;
     /// handle method enter / auto-leave tracing, with some custom text
@@ -1150,6 +1179,7 @@ type
     fLogProcSortInternalOrder: TLogProcSortOrder;
     /// used by ProcessOneLine//GetLogLevelTextMap
     fLogLevelsTextMap: array[TSynLogInfo] of cardinal;
+    fIsJournald: boolean;
     procedure SetLogProcMerged(const Value: boolean);
     function GetEventText(index: integer): RawUTF8;
     function GetLogLevelFromText(LineBeg: PUTF8Char): TSynLogInfo;
@@ -1527,7 +1557,6 @@ function GetLastExceptions(Depth: integer=0): variant; overload;
 /// convert low-level exception information into some human-friendly text
 function ToText(var info: TSynLogExceptionInfo): RawUTF8; overload;
 
-
 /// a TSynLogArchiveEvent handler which will delete older .log files
 function EventArchiveDelete(const aOldLogFileName, aDestinationPath: TFileName): boolean;
 
@@ -1734,8 +1763,12 @@ constructor TSynMapFile.Create(const aExeName: TFileName=''; MabCreate: boolean=
       end;
     end;
     procedure ReadSymbols;
-    var Beg: PAnsiChar;
+    var Beg: PUtf8Char;
         Sym: TSynMapSymbol;
+        {$ifdef ISDELPHI2005ANDUP}
+        u, l: PtrInt;
+        LastUnitUp: RawUTF8; // e.g. 'MORMOT.CORE.DATA.'
+        {$endif ISDELPHI2005ANDUP}
     begin
       NextLine;
       NextLine;
@@ -1743,36 +1776,29 @@ constructor TSynMapFile.Create(const aExeName: TFileName=''; MabCreate: boolean=
         if GetCode(Sym.Start) then begin
           while (P<PEnd) and (P^=' ') do inc(P);
           Beg := pointer(P);
+          while (P<PEnd) and (P^>' ') do inc(P);
           {$ifdef ISDELPHI2005ANDUP}
           // trim left 'UnitName.' for each symbol (since Delphi 2005)
-          case PWord(P)^ of // ignore RTL namespaces
-          ord('S')+ord('y') shl 8:
-            if IdemPChar(P+2,'STEM.') then
-              if IdemPChar(P+7,'WIN.') then inc(P,9) else
-              if IdemPChar(P+7,'RTTI.') then inc(P,10) else
-              if IdemPChar(P+7,'TYPES.') then inc(P,10) else
-              if IdemPChar(P+7,'ZLIB.') then inc(P,10) else
-              if IdemPChar(P+7,'CLASSES.') then inc(P,10) else
-              if IdemPChar(P+7,'SYSUTILS.') then inc(P,10) else
-              if IdemPChar(P+7,'VARUTILS.') then inc(P,10) else
-              if IdemPChar(P+7,'STRUTILS.') then inc(P,10) else
-              if IdemPChar(P+7,'SYNCOBJS.') then inc(P,10) else
-              if IdemPChar(P+7,'GENERICS.') then inc(P,16) else
-              if IdemPChar(P+7,'CHARACTER.') then inc(P,10) else
-              if IdemPChar(P+7,'TYPINFO.') then inc(P,10) else
-              if IdemPChar(P+7,'VARIANTS.') then inc(P,10);
-          ord('W')+ord('i') shl 8: if IdemPChar(P+2,'NAPI.') then inc(P,7);
-          ord('F')+ord('m') shl 8: if IdemPChar(P+2,'X.') then inc(P,7);
-          ord('V')+ord('c') shl 8: if IdemPChar(P+2,'L.') then inc(P,7);
+          if (LastUnitUp <> '') and IdemPChar(Beg, pointer(LastUnitUp)) then
+            // common case since symbols are grouped by address, i.e. by unit
+            inc(Beg, length(LastUnitUp))
+          else begin // manual unit name search
+            LastUnitUp := '';
+            for u := 0 to fUnits.Count - 1 do
+              with fUnit[u].Symbol do begin
+                l := length(Name);
+                if (Beg[l] = '.') and (l > length(LastUnitUp)) and
+                   IdemPropNameU(Name, Beg, l) then
+                  LastUnitUp := UpperCase(Name); // find longest match
+              end;
+            if LastUnitUp <> '' then begin
+              l := length(LastUnitUp);
+              SetLength(LastUnitUp, l + 1);
+              LastUnitUp[l] := '.';
+              inc(Beg, l + 1);
+            end;
           end;
-          while (P<PEnd) and (P^<>'.') do if P^<=' ' then break else inc(P);
-          if P^='.' then begin
-            while (P<PEnd) and (P^='.') do inc(P);
-            Beg := pointer(P);
-          end else
-            P := pointer(Beg); // no '.' found
           {$endif ISDELPHI2005ANDUP}
-          while (P<PEnd) and (P^>' ') do inc(P);
           FastSetString(Sym.Name,Beg,P-Beg);
           if (Sym.Name<>'') and not (Sym.Name[1] in ['$','?']) then
             fSymbols.Add(Sym);
@@ -1902,13 +1928,13 @@ constructor TSynMapFile.Create(const aExeName: TFileName=''; MabCreate: boolean=
     end;
   end;
 
-var SymCount, UnitCount, i: integer;
+var i: integer;
     MabFile: TFileName;
     MapAge, MabAge: TDateTime;
     U: RawUTF8;
 begin
-  fSymbols.Init(TypeInfo(TSynMapSymbolDynArray),fSymbol,@SymCount);
-  fUnits.Init(TypeInfo(TSynMapUnitDynArray),fUnit,nil,nil,nil,@UnitCount);
+  fSymbols.Init(TypeInfo(TSynMapSymbolDynArray),fSymbol,@fSymCount);
+  fUnits.Init(TypeInfo(TSynMapUnitDynArray),fUnit,nil,nil,nil,@fUnitCount);
   fUnitSynLogIndex := -1;
   fUnitSystemIndex := -1;
   // 1. search for an external .map file matching the running .exe/.dll name
@@ -1932,19 +1958,19 @@ begin
     if (MapAge>0) and (MabAge<MapAge) then
       LoadMap; // if no faster-to-load .mab available and accurate
     // 2. search for a .mab file matching the running .exe/.dll name
-    if (SymCount=0) and (MabAge<>0) then
+    if (fSymCount=0) and (MabAge<>0) then
       LoadMab(MabFile);
     // 3. search for an embedded compressed .mab file appended to the .exe/.dll
-    if SymCount=0 then
+    if fSymCount=0 then
       if aExeName='' then
         LoadMab(GetModuleName(hInstance)) else
         LoadMab(aExeName);
     // finalize symbols
-    if SymCount>0 then begin
-      for i := 1 to SymCount-1 do
+    if fSymCount>0 then begin
+      for i := 1 to fSymCount-1 do
         assert(fSymbol[i].Start>fSymbol[i-1].Stop);
-      SetLength(fSymbol,SymCount);
-      SetLength(fUnit,UnitCount);
+      SetLength(fSymbol,fSymCount);
+      SetLength(fUnit,fUnitCount);
       fSymbols.Init(TypeInfo(TSynMapSymbolDynArray),fSymbol);
       fUnits.Init(TypeInfo(TSynMapUnitDynArray),fUnit);
       if MabCreate then
@@ -2243,14 +2269,20 @@ begin
     PointerToHex(pointer(aAddressAbsolute),result);
     exit;
   end;
-  result := '';
   offset := AbsoluteToOffset(aAddressAbsolute);
   s := FindSymbol(offset);
   u := FindUnit(offset,Line);
-  if (s<0) and (u<0) then
+  if (s<0) and (u<0) then begin
+    {$ifdef FPC} // note: BackTraceStrFunc is much slower than TSynMapFile.Log
+    if @BackTraceStrFunc=@SysBackTraceStr then // has debug information?
+      PointerToHex(pointer(aAddressAbsolute),result) else
+      ShortStringToAnsi7String(BackTraceStrFunc(pointer(aAddressAbsolute)),result);
+    {$endif FPC}
     exit;
+  end;
+  result := result+' ';
   if u>=0 then begin
-    result := Units[u].Symbol.Name;
+    result := result+Units[u].Symbol.Name;
     if s>=0 then
       if Symbols[s].Name=result then
         s := -1 else
@@ -2267,6 +2299,19 @@ begin
   if (exc=nil) or (exc.RaisedAt=nil) then
     result := '' else
     result := GetInstanceMapFile.FindLocation(PtrUInt(exc.RaisedAt));
+end;
+
+class function TSynMapFile.FindStackTrace(
+  const Ctxt: TSynLogExceptionContext): TRawUTF8DynArray;
+var i: PtrInt;
+    exe: TSynMapFile;
+begin
+  result := nil;
+  exe := GetInstanceMapFile;
+  AddRawUTF8(result,exe.FindLocation(Ctxt.EAddr));
+  for i := 0 to Ctxt.EStackCount-1 do
+    if (i=0) or (PPtrUIntArray(Ctxt.EStack)[i]<>PPtrUIntArray(Ctxt.EStack)[i-1]) then
+      AddRawUTF8(result,exe.FindLocation(PPtrUIntArray(Ctxt.EStack)[i]));
 end;
 
 function TSynMapFile.FindUnit(const aUnitName: RawUTF8): integer;
@@ -2295,6 +2340,11 @@ begin
     result := UTF8ToString(map.fUnit[u].FileName);
 end;
 
+class function TSynMapFile.FromCurrentExecutable: TSynMapFile;
+begin
+  result := GetInstanceMapFile;
+end;
+
 
 { TSynLogFamily }
 
@@ -2318,6 +2368,9 @@ threadvar
   // - the current TSynLogFile instance of the living thread is
   // ! SynLogFileList[SynLogFileIndexThreadVar[TSynLogFamily.Ident]-1]
   SynLogFileIndexThreadVar: TSynLogFileIndex;
+  /// each thread can have exceptions interception disabled
+  // - as set by TSynLogFamily.ExceptionIgnoreCurrentThread property
+  ExceptionIgnorePerThread: boolean;
 
 /// if defined, will use AddVectoredExceptionHandler() API call
 // - this one does not produce accurate stack trace by now, and is supported
@@ -2601,6 +2654,8 @@ var log: TSynLog;
     {$ifdef FPC}i: PtrInt;{$endif}
 label adr,fin;
 begin
+  if ExceptionIgnorePerThread then
+    exit;
   {$ifdef CPU64DELPHI} // Delphi<XE6 in System.pas to retrieve x64 dll exit code
   {$ifndef ISDELPHIXE6}
   if (Ctxt.EInstance<>nil) and // Ctxt.EClass is EExternalException
@@ -2651,7 +2706,7 @@ begin
          DefaultSynLogExceptionToStr(log.fWriter,Ctxt) then
         goto fin;
 adr:  log.fWriter.Add(' [%] at ',[log.fThreadContext^.ThreadName],twOnSameLine);
-      {$ifdef FPC} // note: BackTraceStrFunc is slower than TSynMapFile.Log
+      {$ifdef FPC} // note: BackTraceStrFunc is much slower than TSynMapFile.Log
       with log.fWriter do
       if @BackTraceStrFunc=@SysBackTraceStr then begin // no debug information
         AddPointer(Ctxt.EAddr); // write addresses as hexa
@@ -3140,6 +3195,16 @@ begin
   fEchoToConsole := aEnabled;
 end;
 
+procedure TSynLogFamily.SetEchoToConsoleUseJournal(aValue: boolean);
+begin
+  if self<>nil then
+    {$ifdef LINUXNOTBSD}
+    if aValue and SystemdIsAvailable then
+      fEchoToConsoleUseJournal := true else
+    {$endif}
+      fEchoToConsoleUseJournal := false;
+end;
+
 function TSynLogFamily.GetSynLogClassName: string;
 begin
   if self=nil then
@@ -3167,6 +3232,17 @@ begin
   fExceptionIgnore := TList.Create;
   fLevelStackTrace := [sllStackTrace,sllException,sllExceptionOS
     {$ifndef FPC},sllError,sllFail,sllLastError,sllDDDError{$endif}];
+end;
+
+function TSynLogFamily.GetExceptionIgnoreCurrentThread: boolean;
+begin
+  result := ExceptionIgnorePerThread;
+end;
+
+procedure TSynLogFamily.SetExceptionIgnoreCurrentThread(
+  aExceptionIgnoreCurrentThread: boolean);
+begin
+  ExceptionIgnorePerThread := aExceptionIgnoreCurrentThread;
 end;
 
 function TSynLogFamily.CreateSynLog: TSynLog;
@@ -3222,7 +3298,6 @@ var
 
 constructor TAutoFlushThread.Create;
 begin
-  FreeOnTerminate := true;
   fEvent := TEvent.Create(nil,false,false,'');
   inherited Create(false);
 end;
@@ -3282,11 +3357,11 @@ begin
   end;
 end;
 
-procedure TSynLogFamily.SetAutoFlush(TimeOut: cardinal);
+procedure TSynLogFamily.StartAutoFlush;
 {$ifdef AUTOFLUSHRAWWIN}var ID: cardinal;{$endif}
 begin
-  fAutoFlush := TimeOut;
-  if (AutoFlushThread=nil) and (TimeOut<>0) {$ifndef FPC}and (DebugHook=0){$endif} then begin
+  if (AutoFlushThread=nil) and (fAutoFlush<>0)
+     {$ifndef FPC}and (DebugHook=0){$endif} then begin
     AutoFlushSecondElapsed := 0;
     {$ifdef AUTOFLUSHRAWWIN}
     AutoFlushThread := pointer(CreateThread(nil,0,@AutoFlushProc,nil,0,ID));
@@ -3306,11 +3381,13 @@ begin
   fDestroying := true;
   EchoRemoteStop;
   if AutoFlushThread<>nil then begin
-    {$ifndef AUTOFLUSHRAWWIN}
+    {$ifdef AUTOFLUSHRAWWIN}
+    AutoFlushThread := nil; // Terminated=true to avoid GPF in AutoFlushProc
+    {$else}
     AutoFlushThread.Terminate;
     AutoFlushThread.fEvent.SetEvent; // notify TAutoFlushThread.Execute
+    FreeAndNil(AutoFlushThread); // wait for the TThread to be terminated
     {$endif}
-    AutoFlushThread := nil; // Terminated=true to avoid GPF in AutoFlushProc
   end;
   ExceptionIgnore.Free;
   try
@@ -3381,18 +3458,20 @@ procedure TSynLogFamily.SynLogFileListEcho(const aEvent: TOnTextWriterEcho;
   aEventAdd: boolean);
 var i: integer;
     files: TSynObjectListLocked;
+    f: TSynLog;
 begin
   if (self=nil) or (SynLogFileList.Count=0) or not Assigned(aEvent) then
     exit;
   files := SynLogFileList;
   files.Safe.Lock;
   try
-    for i := 0 to files.Count-1 do
-      if TSynLog(files.List[i]).fFamily=self then
-        with TSynLog(files.List[i]).fWriter do
-          if aEventAdd then
-            EchoAdd(aEvent) else
-            EchoRemove(aEvent);
+    for i := 0 to files.Count-1 do begin
+      f := files.List[i];
+      if f.fFamily=self then
+        if aEventAdd then
+          f.fWriter.EchoAdd(aEvent) else
+          f.fWriter.EchoRemove(aEvent);
+    end;
   finally
     files.Safe.UnLock;
   end;
@@ -3433,6 +3512,7 @@ begin
     except
       on Exception do ;
     end;
+  fEchoRemoteClient := nil;
   SynLogFileListEcho(fEchoRemoteEvent,false); // unsubscribe
   fEchoRemoteEvent := nil;
 end;
@@ -4030,10 +4110,30 @@ function TSynLog.ConsoleEcho(Sender: TTextWriter; Level: TSynLogInfo;
 {$ifdef MSWINDOWS}
 var tmp: AnsiString;
 {$endif}
+{$ifdef LINUXNOTBSD}
+var
+  tmp, mtmp: RawUTF8;
+  jvec: Array[0..1] of TioVec;
+{$endif}
 begin
   result := true;
   if not (Level in fFamily.fEchoToConsole) then
     exit;
+  {$ifdef LINUXNOTBSD}
+  if Family.EchoToConsoleUseJournal then begin
+    if length(Text)<18 then // should be at last "20200615 08003008  "
+      exit;
+    FormatUTF8('PRIORITY=%', [LOG_TO_SYSLOG[Level]],tmp);
+    jvec[0].iov_base := pointer(tmp);
+    jvec[0].iov_len := length(tmp);
+    // skip time "20200615 08003008  ." - journal do it for us; and first space after it
+    FormatUTF8('MESSAGE=%', [PUTF8Char(pointer(Text))+18],mtmp);
+    jvec[1].iov_base := pointer(mtmp);
+    jvec[1].iov_len := length(mtmp);
+    ExternalLibraries.sd_journal_sendv(@jvec[0],2);
+    exit;
+  end;
+  {$endif}
   TextColor(LOG_CONSOLE_COLORS[Level]);
   {$ifdef MSWINDOWS}
   tmp := CurrentAnsiConvert.UTF8ToAnsi(Text);
@@ -4042,7 +4142,7 @@ begin
   {$endif}
   writeln(tmp);
   {$else}
-  write(Text,#13#10);
+  writeln(Text);
   {$endif}
   ioresult;
   TextColor(ccLightGray);
@@ -4453,6 +4553,7 @@ begin
 end;
 
 procedure TSynLog.PerformRotation;
+const _LOG_SYNLZ: array[boolean] of TFileName = ('.synlz','.log');
 var currentMaxSynLZ: cardinal;
     i: integer;
     FN: array of TFileName;
@@ -4466,7 +4567,8 @@ begin
     if fFamily.fRotateFileCount>1 then begin
       SetLength(FN,fFamily.fRotateFileCount-1);
       for i := fFamily.fRotateFileCount-1 downto 1 do begin
-        FN[i-1] := ChangeFileExt(fFileName,'.'+IntToStr(i)+'.synlz');
+        FN[i-1] := ChangeFileExt(fFileName,
+          '.'+IntToStr(i)+_LOG_SYNLZ[fFamily.fRotateFileNoCompression]);
         if (currentMaxSynLZ=0) and FileExists(FN[i-1]) then
           currentMaxSynLZ := i;
       end;
@@ -4474,7 +4576,9 @@ begin
         DeleteFile(FN[currentMaxSynLZ-1]); // delete e.g. '9.synlz'
       for i := fFamily.fRotateFileCount-2 downto 1 do
         RenameFile(FN[i-1],FN[i]); // e.g. '8.synlz' -> '9.synlz'
-      FileSynLZ(fFileName,FN[0],LOG_MAGIC); // main -> '1.synlz'
+      if fFamily.fRotateFileNoCompression then
+        RenameFile(fFileName,FN[0]) else      // main -> '1.log'
+        FileSynLZ(fFileName,FN[0],LOG_MAGIC); // main -> '1.synlz'
     end;
     DeleteFile(fFileName);
   end;
@@ -4658,6 +4762,8 @@ begin
     fWriter.EchoAdd(fFamily.EchoCustom);
   if Assigned(fFamily.fEchoRemoteClient) then
     fWriter.EchoAdd(fFamily.fEchoRemoteEvent);
+  if (AutoFlushThread=nil) and (fFamily.AutoFlushTimeOut<>0) then
+    fFamily.StartAutoFlush;
 end;
 
 function TSynLog.GetFileSize: Int64;
@@ -5014,11 +5120,33 @@ var aWow64, feat: RawUTF8;
     OK: boolean;
 begin
   // 1. calculate fLines[] + fCount and fLevels[] + fLogProcNatural[] from .log content
-  fLineHeaderCountToIgnore := 3;
+  fLineHeaderCountToIgnore := 3; fIsJournald := false;
+  if IdemPChar(pointer(fMap.Buffer),'-- LOGS BEGIN AT') then begin
+    //-- Logs begin at Sun 2020-06-07 12:42:31 EEST, end at Thu 2020-06-18 18:08:52 EEST. --
+    fIsJournald := true;
+    fHeaderLinesCount := 1;
+    fLineHeaderCountToIgnore := 1;
+  end else begin
+    //2020-06-18T13:28:20.754089+0300 ub[12316]:
+    Iso8601ToDateTimePUTF8CharVar(pointer(fMap.Buffer),26,fStartDateTime);
+    if unaligned(fStartDateTime) <> 0 then begin
+      if (fMap.Buffer+8)^ <> ' ' then //20200821 14450738 ... - syn log without header
+        fIsJournald := true;
+      fHeaderLinesCount := 0;
+      fLineHeaderCountToIgnore := 0;
+    end;
+  end;
   inherited LoadFromMap(100);
   // 2. fast retrieval of header
   OK := false;
   try
+    // journald export or TSynLog WITHOUT regular header
+    if fIsJournald or (fLineHeaderCountToIgnore=0) then begin
+      if LineSizeSmallerThan(1,34) then exit;
+      Iso8601ToDateTimePUTF8CharVar(fLines[1],26,fStartDateTime);
+      if fStartDateTime=0 then
+        exit;
+    end else begin // TSynLog regular header
 {  C:\Dev\lib\SQLite3\exe\TestSQL3.exe 0.0.0.0 (2011-04-07 11:09:06)
    Host=BW013299 User=G018869 CPU=1*0-15-1027 OS=2.3=5.1.2600 Wow64=0 Freq=3579545
    TSynLog 1.13 LVCL 2011-04-07 12:04:09 }
@@ -5084,6 +5212,7 @@ begin
     end;
     if fStartDateTime=0 then
       exit;
+    end;
     // 3. compute fCount and fLines[] so that all fLevels[]<>sllNone
     CleanLevels(self);
     if Length(fLevels)-fCount>16384 then begin // size down only if worth it
@@ -5277,16 +5406,27 @@ procedure TSynLogFile.ProcessOneLine(LineBeg, LineEnd: PUTF8Char);
 var thread,n: cardinal;
     MS: integer;
     L: TSynLogInfo;
+    p: PUTF8Char;
+    dcOffset: integer;
 begin
   inherited ProcessOneLine(LineBeg,LineEnd);
   if length(fLevels)<fLinesMax then
     SetLength(fLevels,fLinesMax);
   if (fCount<=fLineHeaderCountToIgnore) or (LineEnd-LineBeg<24) then
     exit;
+  if fIsJournald then
+    dcOffset := 2 else // point to last 2 digit of year
+    dcOffset := 0;
   if fLineLevelOffset=0 then begin
     if (fCount>50) or not (LineBeg[0] in ['0'..'9']) then
       exit; // definitively does not sound like a .log content
-    if LineBeg[8]=' ' then begin
+    if fIsJournald then begin
+      p := PosChar(LineBeg, ']'); // time proc[pid]:
+      if p=nil then
+        exit; // not a log
+      fLineLevelOffset := (p - LineBeg) + 4; // ":  "
+      fDayCurrent := PInt64(LineBeg+dcOffset)^;
+    end else if LineBeg[8]=' ' then begin
       // YYYYMMDD HHMMSS is one char bigger than Timestamp
       fLineLevelOffset := 19;
       fDayCurrent := PInt64(LineBeg)^;
@@ -5306,8 +5446,8 @@ begin
   L := GetLogLevelFromText(LineBeg);
   if L=sllNone then
     exit;
-  if (fDayChangeIndex<>nil) and (fDayCurrent<>PInt64(LineBeg)^) then begin
-    fDayCurrent := PInt64(LineBeg)^;
+  if (fDayChangeIndex<>nil) and (fDayCurrent<>PInt64(LineBeg+dcOffset)^) then begin
+    fDayCurrent := PInt64(LineBeg+dcOffset)^;
     AddInteger(fDayChangeIndex,fCount-1);
   end;
   if fThreads<>nil then begin
@@ -5968,4 +6108,7 @@ initialization
 finalization
   SynLogFileList.Free; // release in proper order: TSynLog then TSynLogFamily
   SynLogFamily.Free;
+  {$ifndef NOEXCEPTIONINTERCEPT}
+  GlobalCurrentHandleExceptionSynLog := nil; // paranoid
+  {$endif}
 end.

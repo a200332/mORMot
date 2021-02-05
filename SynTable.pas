@@ -6,7 +6,7 @@ unit SynTable;
 (*
     This file is part of Synopse framework.
 
-    Synopse framework. Copyright (C) 2020 Arnaud Bouchez
+    Synopse framework. Copyright (C) 2021 Arnaud Bouchez
       Synopse Informatique - https://synopse.info
 
   *** BEGIN LICENSE BLOCK *****
@@ -25,7 +25,7 @@ unit SynTable;
 
   The Initial Developer of the Original Code is Arnaud Bouchez.
 
-  Portions created by the Initial Developer are Copyright (C) 2020
+  Portions created by the Initial Developer are Copyright (C) 2021
   the Initial Developer. All Rights Reserved.
 
   Contributor(s):
@@ -697,6 +697,20 @@ type
     // be used for truncation againts the MaxLength parameter
     property UTF8Length: boolean read fUTF8Length write fUTF8Length;
   end;
+
+resourcestring
+  sInvalidIPAddress = '"%s" is an invalid IP v4 address';
+  sInvalidEmailAddress = '"%s" is an invalid email address';
+  sInvalidPattern = '"%s" does not match the expected pattern';
+  sCharacter01n = 'character,character,characters';
+  sInvalidTextLengthMin = 'Expect at least %d %s';
+  sInvalidTextLengthMax = 'Expect up to %d %s';
+  sInvalidTextChar = 'Expect at least %d %s %s,Expect up to %d %s %s,'+
+    'alphabetical,digital,punctuation,lowercase,uppercase,space,'+
+    'Too much spaces on the left,Too much spaces on the right';
+  sValidationFailed = '"%s" rule failed';
+  sValidationFieldVoid = 'An unique key field must not be void';
+  sValidationFieldDuplicate = 'Value already used for this unique key field';
 
 
 { ************ Database types and classes ************************** }
@@ -2167,7 +2181,7 @@ type
     fReaderTemp: PRawByteString;
     fLoadFromLastUncompressed, fSaveToLastUncompressed: integer;
     fLoadFromLastAlgo: TAlgoCompress;
-    /// low-level virtual methods implementing the persistence reading
+    /// low-level virtual methods implementing the persistence
     procedure LoadFromReader; virtual;
     procedure SaveToWriter(aWriter: TFileBufferWriter); virtual;
   public
@@ -2921,9 +2935,6 @@ type
     function NextPendingTask: RawByteString; virtual;
     /// flush all pending tasks
     procedure Clear; virtual;
-    /// access to the locking methods of this instance
-    // - use Safe.Lock/TryLock with a try ... finally Safe.Unlock block
-    property Safe: PSynlocker read fSafe;
     /// access to the internal TPendingTaskListItem.Timestamp stored value
     // - corresponding to the current time
     // - default implementation is to return GetTickCount64, with a 16 ms
@@ -3944,7 +3955,7 @@ function GetDiskInfo(var aDriveFolderOrFile: TFileName;
   {$ifdef MSWINDOWS}; aVolumeName: PFileName = nil{$endif}): boolean;
 
 
-{ ************ Markup (e.g. Emoji) process  ************************** }
+{ ************ Markup (e.g. HTML or Emoji) process ******************** }
 
 type
   /// tune AddHtmlEscapeWiki/AddHtmlEscapeMarkdown wrapper functions process
@@ -5119,6 +5130,11 @@ procedure ToSBFStr(const Value: RawByteString; out Result: TSBFString);
 
 implementation
 
+{$ifdef WITH_FASTMM4STATS}
+uses
+  FastMM4; // override OS information by actual FastMM4 status
+{$endif WITH_FASTMM4STATS}
+
 {$ifdef FPCLINUX}
 uses
   termio,
@@ -5212,7 +5228,7 @@ end;
 { TSynTable }
 
 {$ifdef CPUX86}
-function SortQWord(const A,B: QWord): integer;
+function SortQWord(const A,B: QWord): integer; {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // Delphi x86 compiler is not efficient, and oldest even incorrect
         mov     ecx, [eax]
         mov     eax, [eax + 4]
@@ -5228,7 +5244,7 @@ asm // Delphi x86 compiler is not efficient, and oldest even incorrect
 @p:     mov     eax, 1
 end;
 
-function SortInt64(const A,B: Int64): integer;
+function SortInt64(const A,B: Int64): integer; {$ifdef FPC} nostackframe; assembler; {$endif}
 asm // Delphi x86 compiler is not efficient at compiling below code
         mov     ecx, [eax]
         mov     eax, [eax + 4]
@@ -6212,8 +6228,8 @@ var len: integer;
     PA: PAnsiChar absolute FieldBuffer;
     PU: PUTF8Char absolute FieldBuffer;
     tmp: RawByteString;
-    {$ifndef UNICODE}
-    WS: WideString;
+    {$ifndef HASVARUSTRING}
+    WS: SynUnicode;
     {$endif}
 begin
   case FieldType of
@@ -6248,7 +6264,7 @@ begin
   tftWinAnsi: begin
     len := FromVarUInt32(PB);
     if len>0 then
-      {$ifdef UNICODE}
+      {$ifdef HASVARUSTRING}
       result := WinAnsiToUnicodeString(PA,len)
       {$else}
       result := CurrentAnsiConvert.AnsiToAnsi(WinAnsiConvert,PA,len)
@@ -6258,7 +6274,7 @@ begin
   tftUTF8: begin
     len := FromVarUInt32(PB);
     if len>0 then
-      {$ifdef UNICODE}
+      {$ifdef HASVARUSTRING}
       result := UTF8DecodeToUnicodeString(PU,len)
       {$else} begin
         UTF8ToSynUnicode(PU,len,WS);
@@ -7692,7 +7708,7 @@ lim2: if IdemPropNameU(Prop,'LIMIT') then
         end else
         exit; // incorrect SQL statement
       end else
-      if Prop<>'' then
+      if (Prop<>'') or not(GotoNextNotSpace(P)^ in [#0, ';']) then
         exit else // incorrect SQL statement
         break; // reached the end of the statement
     end;
@@ -10140,7 +10156,7 @@ end;
 
 {$ifdef CPUINTEL} // crc32c SSE4.2 hardware accellerated dword hash
 function crc32csse42(buf: pointer): cardinal;
-{$ifdef CPUX86}
+{$ifdef CPUX86} {$ifdef FPC} nostackframe; assembler; {$endif}
 asm
         mov     edx, eax
         xor     eax, eax
@@ -12344,7 +12360,7 @@ begin
   if result=0 then
     exit;
   count := result;
-  if count>length(Values) then // only set length is not big enough
+  if count>length(Values) then // change Values[] length only if not big enough
     SetLength(Values,count);
   PI := pointer(Values);
   fixedsize := ReadVarUInt32;
@@ -13696,12 +13712,12 @@ end;
 
 procedure TSynAuthenticationAbstract.AuthenticateUser(const aName, aPassword: RawUTF8);
 begin
-  raise ESynException.CreateFmt('%.AuthenticateUser() is not implemented',[self]);
+  raise ESynException.CreateUTF8('%.AuthenticateUser() is not implemented',[self]);
 end;
 
 procedure TSynAuthenticationAbstract.DisauthenticateUser(const aName: RawUTF8);
 begin
-  raise ESynException.CreateFmt('%.DisauthenticateUser() is not implemented',[self]);
+  raise ESynException.CreateUTF8('%.DisauthenticateUser() is not implemented',[self]);
 end;
 
 function TSynAuthenticationAbstract.CheckCredentials(const UserName: RaWUTF8;
@@ -16624,7 +16640,7 @@ var i: integer;
      if not withfreespace or not GetDiskInfo(p.mounted,av,fr,tot) then
        {$ifdef MSWINDOWS}
        FormatShort('%: % (%)',[p.mounted[1],p.name,KB(p.size,nospace)],result) else
-       FormatShort(F[nospace],[p.mounted[1],p.name,KB(p.size,nospace)],result);
+       FormatShort(F[nospace],[p.mounted[1],p.name,KB(fr,nospace),KB(tot,nospace)],result);
        {$else}
        FormatShort('% % (%)',[p.mounted,p.name,KB(p.size,nospace)],result) else
        FormatShort(F[nospace],[p.mounted,p.name,KB(fr,nospace),KB(tot,nospace)],result);
