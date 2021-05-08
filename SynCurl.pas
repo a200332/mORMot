@@ -456,7 +456,7 @@ var
     {$endif FPC}
     /// in case CurlEnableShare is called this array holds a
     // critical section per curl_lock_data
-    share_cs: array[0..Ord(CURL_LOCK_DATA_PSL)] of TRTLCriticalSection;
+    share_cs: array[curl_lock_data] of TRTLCriticalSection;
     /// global TCurlShare object, created by CurlEnableGlobalShare
     globalShare: TCurlShare;
     /// initialize the library
@@ -779,8 +779,6 @@ begin
         inc(P);
       end;
       curl.Module := h;
-      curl.globalShare := nil;
-      CurlEnableGlobalShare; // won't hurt, and may benefit even for the OS
     except
       on E: Exception do begin
         if h<>0 then
@@ -795,6 +793,8 @@ begin
     curl.infoText := format('%s version %s',[LIBCURL_DLL,curl.info.version]);
     if curl.info.ssl_version<>nil then
       curl.infoText := format('%s using %s',[curl.infoText,curl.info.ssl_version]);
+    curl.globalShare := nil;
+    CurlEnableGlobalShare; // won't hurt, and may benefit even for the OS
 //   api := 0; with curl.info do while protocols[api]<>nil do begin
 //     write(protocols[api], ' '); inc(api); end; writeln(#13#10,curl.infoText);
   finally
@@ -805,18 +805,18 @@ end;
 procedure curlShareLock(handle: TCurl; data: curl_lock_data;
   locktype: curl_lock_access; userptr: pointer); cdecl;
 begin
-  EnterCriticalSection(curl.share_cs[Ord(data)]);
+  EnterCriticalSection(curl.share_cs[data]);
 end;
 
 procedure curlShareUnLock(handle: TCurl; data: curl_lock_data;
   userptr: pointer); cdecl;
 begin
-  LeaveCriticalSection(curl.share_cs[Ord(data)]);
+  LeaveCriticalSection(curl.share_cs[data]);
 end;
 
 function CurlEnableGlobalShare: boolean;
 var
-  i: PtrInt;
+  d: curl_lock_data;
 begin
   result := false;
   if not CurlIsAvailable or (curl.globalShare<>nil) then
@@ -824,19 +824,23 @@ begin
   curl.globalShare := curl.share_init;
   if curl.globalShare = nil then
     exit; // something went wrong (out of memory, etc.) and therefore the share object was not created
-  for i := 0 to Ord(CURL_LOCK_DATA_PSL) do
-    InitializeCriticalSection(curl.share_cs[i]);
+  for d := low(d) to high(d) do
+    InitializeCriticalSection(curl.share_cs[d]);
   curl.share_setopt(curl.globalShare,CURLSHOPT_LOCKFUNC,@curlShareLock);
   curl.share_setopt(curl.globalShare,CURLSHOPT_UNLOCKFUNC,@curlShareUnLock);
   curl.share_setopt(curl.globalShare,CURLSHOPT_SHARE,CURL_LOCK_DATA_DNS);
   curl.share_setopt(curl.globalShare,CURLSHOPT_SHARE,CURL_LOCK_DATA_SSL_SESSION);
-  curl.share_setopt(curl.globalShare,CURLSHOPT_SHARE,CURL_LOCK_DATA_CONNECT);
+  // CURL_LOCK_DATA_CONNECT triggers GPF e.g. on Debian Burster 10
+  if curl.info.version_num>=$00074400 then // seems to be fixed in 7.68
+    // see https://github.com/curl/curl/issues/4544
+    curl.share_setopt(curl.globalShare,CURLSHOPT_SHARE,CURL_LOCK_DATA_CONNECT);
+  // CURL_LOCK_DATA_CONNECT triggers GPF on Debian Burster 10
   result := true;
 end;
 
 function CurlDisableGlobalShare: CURLSHcode;
 var
-  i: PtrInt;
+  d: curl_lock_data;
 begin
   result := CURLSHE_OK;
   if curl.globalShare = nil then
@@ -844,8 +848,8 @@ begin
   result := curl.share_cleanup(curl.globalShare);
   if result = CURLSHE_OK then
     curl.globalShare := nil;
-  for i := 0 to Ord(CURL_LOCK_DATA_PSL) do
-    DeleteCriticalSection(curl.share_cs[i]);
+  for d := low(d) to high(d) do
+    DeleteCriticalSection(curl.share_cs[d]);
 end;
 
 initialization
@@ -856,7 +860,7 @@ initialization
 finalization
   {$ifdef LIBCURLSTATIC}
   if curl_static_initialized then begin
-    CurlDisableGlbalShare;
+    CurlDisableGlobalShare;
     curl.global_cleanup;
   end;
   {$else}
